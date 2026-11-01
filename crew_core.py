@@ -1,107 +1,112 @@
-import pandas as pd
+import openpyxl
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict
 from datetime import datetime
 import re
 
-# ==========================================
-# BÖLÜM 1: VERİ MODELLERİ VE ŞABLON YAPISI
-# ==========================================
-
 @dataclass
 class Evidence:
-    """UAB PDF'inden, AI'dan veya manuel girişten gelen ham belge verisi."""
     code: str
-    document_no: Optional[str] = None
+    document_no: str
     issue_date: Optional[datetime] = None
     expiry_date: Optional[datetime] = None
     verified: bool = False
-    raw_text: Optional[str] = None
+    raw_text: str = ""
 
 @dataclass
 class Result:
-    """evaluate() fonksiyonundan çıkan sonuç objesi."""
     code: str
     status: str
     message: str
     evidence_used: Optional[Evidence] = None
 
-# --- ŞABLON SATIR İMZALARI (ITEM_SIGNATURES) ---
-ITEM_SIGNATURES = {
-    10: "PASSPORT",
-    11: "SEAMAN_BOOK",
-    12: "MEDICAL_CERT",
-    13: "YELLOW_FEVER",
-    15: "BASIC_SAFETY",
-}
-
-def load_rules_from_excel(filepath: str, rank: str, vessel_type: str = "DEFAULT") -> Dict[str, str]:
-    """Madde 3.1: Kural kaynağı 35-101 Excel'idir."""
-    df = pd.read_excel(filepath, sheet_name="DOC_MATRIX")
-    rules = {}
-    return rules
+def load_rules_from_excel(filepath: str, rank: str, is_tanker: bool = False) -> Dict[str, str]:
+    try:
+        wb = openpyxl.load_workbook(filepath, data_only=True)
+        ws = wb["DOC_MATRIX"] if "DOC_MATRIX" in wb.sheetnames else wb.active
+        
+        rank_col = 6
+        rank_clean = rank.strip().lower()
+        for col in range(6, ws.max_column + 1):
+            val = ws.cell(row=9, column=col).value
+            if val and str(val).strip().lower() in rank_clean:
+                rank_col = col
+                break
+                
+        rules = {}
+        for row in range(14, ws.max_row + 1):
+            doc_name = ws.cell(row=row, column=2).value
+            rule_val = ws.cell(row=row, column=rank_col).value
+            
+            if doc_name and rule_val:
+                rule_str = str(rule_val).strip().upper()
+                if rule_str in ["X", "D"]:
+                    doc_clean = str(doc_name).strip().upper()
+                    matched_code = None
+                    
+                    if "PASSPORT" in doc_clean or "PASAPORT" in doc_clean: matched_code = "PASSPORT"
+                    elif "SEAMAN" in doc_clean or "CÜZDAN" in doc_clean: matched_code = "SEAMAN_BOOK"
+                    elif "MEDICAL" in doc_clean or "SAĞLIK" in doc_clean: matched_code = "MEDICAL_CERT"
+                    elif "YELLOW" in doc_clean or "FEVER" in doc_clean: matched_code = "YELLOW_FEVER"
+                    elif "STCW" in doc_clean or "BASIC" in doc_clean or "SAFETY" in doc_clean: matched_code = "BASIC_SAFETY"
+                    elif "GMDSS" in doc_clean or "RADIO" in doc_clean: matched_code = "GMDSS"
+                    elif "COMPETENCY" in doc_clean or "YETERLİK" in doc_clean or "EHLİYET" in doc_clean: matched_code = "COMPETENCY"
+                    elif "CRIMINAL" in doc_clean or "SİCİL" in doc_clean: matched_code = "CRIMINAL_RECORD"
+                    elif "ECDIS" in doc_clean: matched_code = "ECDIS_GENERIC"
+                    
+                    if not matched_code:
+                        matched_code = doc_clean.replace(" ", "_")
+                        
+                    rules[matched_code] = rule_str
+                    
+        return rules
+    except Exception as e:
+        print(f"Excel rule read error: {e}")
+        return {}
 
 def _check_dates(evidence: Evidence, rule_type: str) -> str:
-    """Madde 5: Yeni tarih kuralı yalnız bu fonksiyon içinde yazılır."""
-    if not evidence.issue_date:
+    if not evidence.issue_date and evidence.code != "YELLOW_FEVER":
         return "REVIEW"
-    
-    if evidence.code == "YELLOW_FEVER" and not evidence.expiry_date:
+    if evidence.code == "YELLOW_FEVER":
         return "OK"
-        
     if evidence.expiry_date and evidence.expiry_date < datetime.now():
         return "EXPIRED"
-        
     return "OK"
 
-# ==========================================
-# BÖLÜM 2: KİMLİK DOĞRULAMA VE DEĞERLENDİRME
-# ==========================================
-
-def verify_identity(uab_tckn: str, uab_cuzdan_no: str, personel_tckn: str, personel_cuzdan_no: str) -> bool:
-    """Madde 3.8: İsim eşleştirmesine asla güvenme; TCKN ve cüzdan no kullan."""
-    if not uab_tckn or not personel_tckn:
-        return False
-    
-    tckn_match = str(uab_tckn).strip() == str(personel_tckn).strip()
-    cuzdan_match = str(uab_cuzdan_no).strip().upper() == str(personel_cuzdan_no).strip().upper()
-    
-    return tckn_match and cuzdan_match
-
-def parse_uab_pdf(pdf_text: str) -> List[Evidence]:
-    """UAB PDF okuyucu mock."""
-    evidences = []
-    return evidences
-
 def evaluate(evidences: List[Evidence], rank: str, excel_path: str, is_tanker: bool = False) -> List[Result]:
-    """Kuralları değerlendirir."""
-    rules = load_rules_from_excel(excel_path, rank)
+    rules = load_rules_from_excel(excel_path, rank, is_tanker)
     results = []
     
-    for doc_code, rule_type in rules.items():
-        if "TANKER" in doc_code and not is_tanker:
+    if not rules:
+        return [Result("ERROR", "MISSING", "Kurallar okunamadı veya rütbe bulunamadı.")]
+    
+    for req_code, rule_type in rules.items():
+        if "TANKER" in req_code and not is_tanker:
             continue
             
-        matched_evidence = next((e for e in evidences if e.code == doc_code), None)
-        
+        matched_evidence = None
+        for ev in evidences:
+            if ev.code == req_code or req_code in ev.code or ev.code in req_code:
+                matched_evidence = ev
+                break
+                
         if not matched_evidence:
             if rule_type == 'D':
-                results.append(Result(code=doc_code, status="OK", message="Atamaya Bağlı - Belge Yok", evidence_used=None))
+                results.append(Result(code=req_code, status="OK", message="Atamaya Bağlı - Belge Yok", evidence_used=None))
             else:
-                results.append(Result(code=doc_code, status="MISSING", message="Zorunlu Belge Eksik", evidence_used=None))
+                results.append(Result(code=req_code, status="MISSING", message="Zorunlu Belge Eksik", evidence_used=None))
             continue
             
         date_status = _check_dates(matched_evidence, rule_type)
-        
         if date_status != "OK":
             msg = "Belge Süresi Dolmuş" if date_status == "EXPIRED" else "Tarih Okunamadı veya Eksik"
-            results.append(Result(code=doc_code, status=date_status, message=msg, evidence_used=matched_evidence))
+            results.append(Result(code=req_code, status=date_status, message=msg, evidence_used=matched_evidence))
             continue
             
         if not matched_evidence.verified:
-            results.append(Result(code=doc_code, status="REVIEW", message="Orijinalden Doğrulanmalı (Kanıtsız Yes Yok)", evidence_used=matched_evidence))
+            results.append(Result(code=req_code, status="REVIEW", message="Orijinalden Doğrulanmalı (Kanıtsız Yes Yok)", evidence_used=matched_evidence))
             continue
             
-        results.append(Result(code=doc_code, status="OK", message="Geçerli", evidence_used=matched_evidence))
+        results.append(Result(code=req_code, status="OK", message="Geçerli", evidence_used=matched_evidence))
         
     return results
